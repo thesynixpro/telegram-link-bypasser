@@ -1,0 +1,22 @@
+# Telegram bot framework (async, v20+ API)
+python-telegram-bot==20.7
+
+# HTTP client that can solve some Cloudflare "JavaScript check" pages
+cloudscraper==1.2.71
+
+# HTML parsing for the static fast path
+beautifulsoup4==4.12.3
+
+# Headless Chromium automation (async API)
+# After "pip install -r requirements.txt" you must run:
+#   playwright install chromium
+# On Linux servers/CI use:
+#   playwright install --with-deps chromium
+# Railway installs the browser automatically via railway.toml.
+playwright==1.44.0
+
+# Loads .env during local development
+python-dotenv==1.0.1
+
+# Explicit pin for the plain-requests fallback used by bypasser.py
+requests==2.32.3

@@ -1,0 +1,15 @@
+# Railway/Nixpacks configuration.
+#
+# The build installs Python dependencies and downloads Chromium together with
+# the Linux shared libraries it needs.  Browsers are written inside /app so the
+# Nixpacks runtime image contains them; bypasser.py detects this directory and
+# sets PLAYWRIGHT_BROWSERS_PATH automatically at startup.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "pip install --upgrade pip && pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright python -m playwright install --with-deps chromium"
+
+[deploy]
+startCommand = "python bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
