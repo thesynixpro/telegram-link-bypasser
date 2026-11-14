@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+import time
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -34,6 +35,7 @@ from telegram.ext import (
 
 from bypasser import (
     BypassError,
+    TOTAL_BYPASS_TIMEOUT,
     bypass,
     get_supported_domain,
     normalize_url,
@@ -174,20 +176,37 @@ async def _handle_bypass(message, context: ContextTypes.DEFAULT_TYPE, raw: str) 
         # A failed "typing…" indicator must not abort the actual bypass.
         logger.debug("Could not send chat action", exc_info=True)
 
+    # Start the bypass in the background and keep the user informed with
+    # progress updates every ~15 seconds.
     try:
-        destination = await bypass(url)
-    except BypassError as exc:
-        await status.edit_text(f"❌ {exc}")
+        bypass_task = asyncio.create_task(bypass(url))
+    except Exception as exc:
+        await status.edit_text(f"❌ Failed to start bypass: {exc}")
         return
+
+    start = time.monotonic()
+    while not bypass_task.done():
+        elapsed = int(time.monotonic() - start)
+        try:
+            await status.edit_text(f"⏳ Bypassing… ({elapsed}s)")
+        except Exception:
+            logger.debug("Could not update progress", exc_info=True)
+        try:
+            await asyncio.wait_for(asyncio.shield(bypass_task), timeout=15)
+        except asyncio.TimeoutError:
+            continue
+        except Exception:
+            break
+
+    try:
+        destination = await asyncio.wait_for(bypass_task, timeout=240)
     except asyncio.TimeoutError:
         logger.warning("Bypass timed out for %s", url)
         await status.edit_text("❌ The request timed out. Please try again later.")
         return
-    except Exception:
+    except Exception as exc:
         logger.exception("Unexpected error while bypassing %s", url)
-        await status.edit_text(
-            "❌ An unexpected error occurred. Please try again later."
-        )
+        await status.edit_text(f"❌ An unexpected error occurred: {exc}")
         return
 
     await status.edit_text(f"✅ Destination:\n{destination}")
