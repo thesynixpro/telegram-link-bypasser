@@ -1,15 +1,20 @@
 # Telegram Link Bypasser (arolinks.com + vplink.in)
 
-A small self-hosted Telegram bot that follows ad-gateway links from
-**arolinks.com** and **vplink.in** and replies with the final destination URL.
-It uses only free, self-contained tooling: `python-telegram-bot`,
-`cloudscraper`, `BeautifulSoup` and headless Chromium via Playwright.
+A self-hosted Telegram bot that follows ad-monetized shortener links through
+their JavaScript countdowns and ad funnels and replies with the **real final
+destination URL**.
+
+The previous version used static HTTP requests and BeautifulSoup/regex. That
+approach stopped at the first ad wall and returned intermediate URLs such as
+`onlinewish.in` / `crimejasoos.in`, so users still saw ads. This version drives
+headless Chromium, keeps clicking through the funnel, and only returns a URL
+once it is outside the blacklist and has stopped changing.
 
 > **Legal / ToS warning**
-> Bypassing a URL shortener may violate that service's Terms of Service and/or
-> the terms of the sites it links to. Use this bot only for links you are
-> authorized to open. The project is provided as-is, with no warranty, and you
-> are responsible for how you use it.
+> Bypassing a URL shortener violates that service's Terms of Service. This
+> project is provided for personal/educational use only, with no warranty. Use
+> it only for links you are authorized to open. You are responsible for how you
+> use it.
 
 ---
 
@@ -17,90 +22,88 @@ It uses only free, self-contained tooling: `python-telegram-bot`,
 
 | File | Purpose |
 | --- | --- |
-| `bot.py` | Telegram entry point: handlers for `/start`, `/bypass <url>` and plain URL messages; reads `TELEGRAM_BOT_TOKEN`; runs long polling. |
-| `bypasser.py` | All bypass logic. Fast static extraction for arolinks, Playwright-first flow for vplink, generic heuristics, timeouts, and the `BypassError` exception. |
+| `bot.py` | Telegram entry point: `/start`, `/bypass <url>`, and plain-message URL detection. Long polling, async handlers, full logging. |
+| `bypasser.py` | All bypass logic: blacklist, `_is_final_url`, cloudscraper fast path for arolinks, and the Playwright domain-escape loop for both sites. |
 | `requirements.txt` | Pinned Python dependencies. |
-| `Procfile` | Tells Railway (and Heroku-style hosts) to run a background worker. |
-| `railway.toml` | Railway/Nixpacks build config. Installs dependencies and Chromium with system libraries at build time. |
+| `Procfile` | Declares a Railway/Heroku-style worker: `worker: python bot.py`. |
+| `railway.toml` | Nixpacks build that installs Python deps and Chromium with system libraries. |
 | `.env.example` | Template for local environment variables. |
-| `README.md` | This file. |
+| `README.md` | This guide. |
 
 ---
 
-## How the bypassing works
+## How the domain-escape loop works
 
-### arolinks.com (`bypass_arolinks`)
+The core fix is in `_escape_ad_funnel()` in `bypasser.py`:
 
-1. **Static fast path** (`cloudscraper`, with a plain `requests` fallback):
-   - Downloads the HTML with realistic browser headers.
-   - Looks for `<meta http-equiv="refresh" content="...url=...">`.
-   - Searches inline JavaScript for redirects:
-     `var url = "..."`, `location.href = "..."`,
-     `location.replace("...")`, `window.open("...")`.
-   - Chooses the last external link that is not the shortener itself.
-   - If a countdown value is visible in the HTML/JS (for example
-     `var seconds = 10`), it waits briefly and retries.
-2. **Playwright fallback**: launches headless Chromium, lets the countdown
-   run, clicks "Continue"/"Get Link"/similar controls, and reads the final
-   URL from the page URL, page HTML, or its links. It also notices destination
-   pages opened in a new tab.
+1. Launch headless Chromium with a Windows Chrome User-Agent and a
+   `1920x1080` viewport.
+2. Open the shortener URL with `wait_until="domcontentloaded"` and a 30-second
+   timeout.
+3. Run at most **8 iterations**. On each pass:
+   - Wait a random **4–6 seconds** for JavaScript countdowns / Cloudflare.
+   - Inspect every open tab. A URL is accepted only if its host is **not** in
+     `BLACKLIST_DOMAINS` **and** the URL has been stable for 3 seconds.
+   - Otherwise click the first visible control from `CLICK_SELECTORS`
+     (`Continue`, `Get Link`, `Skip Ad`, `#btn6`, `#getlink`, ...) and wait for
+     the next page.
+4. If the funnel is still blocked after the loop, scan the page anchors for a
+   non-blacklisted `http(s)` link, prioritizing link text like `Download`,
+   `Continue`, or `Here`.
+5. If no final URL exists, raise
+   `BypassError("Could not escape the ad funnel — the shortener may have changed its layout.")`
 
-### vplink.in (`bypass_vplink`)
+`arolinks.com` also gets an optional cloudscraper fast path: if the raw HTML
+contains a meta refresh or `window.location.href` pointing outside the
+blacklist, that URL is returned immediately. Otherwise the browser path runs.
+`vplink.in` always goes straight to Playwright because of Cloudflare and the
+multi-hop funnel.
 
-1. **Playwright is the primary method.** The page is behind Cloudflare and
-   uses ad intermediates, so JavaScript must run. The code:
-   - opens the page with a realistic user agent,
-   - waits for a Cloudflare challenge to clear (title/selector checks),
-   - waits for the page to settle,
-   - clicks countdown/continue controls (handling new tabs and dialogs),
-   - captures the destination from `page.url`, the HTML, or external anchors.
-2. **cloudscraper is the secondary method**, tried only if Playwright fails.
+The shortener/ad-partner blacklist is:
 
-Both paths use a browser `--no-sandbox` configuration because Railway runs
-containers as root. The Chromium instance is always closed in a `finally`
-block. Each stage has a timeout: 20 s for HTTP, 25 s for navigation, and a
-90 s hard cap for a browser attempt.
+```text
+arolinks.com
+vplink.in
+onlinewish.in
+crimejasoos.in
+```
+
+Everything is closed in a `finally` block. There is no paid API and no external
+bypass service.
 
 ---
 
 ## 1. Create the Telegram bot
 
 1. Open Telegram and start a chat with **@BotFather**.
-2. Send `/newbot`, choose a name and a username ending in `bot`.
-3. Copy the token BotFather gives you (looks like
-   `123456789:AAE...`).
-4. Optionally send `/setprivacy` to BotFather and disable privacy mode if you
-   want the bot to see all group messages. For private chats this is not
-   needed.
+2. Send `/newbot`, choose a name, and pick a username ending in `bot`.
+3. Copy the token BotFather returns (looks like `123456789:AAE...`).
+4. For groups, disable privacy mode with `/setprivacy` if you want the bot to
+   see all messages. Private chats work without this.
 
 ---
 
-## 2. Local testing
+## 2. Test locally
 
 Python **3.10+** is required.
 
 ```bash
-# 1. Create and activate a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Install the browser used by Playwright
+# Download Chromium. On a fresh Linux machine also install system libraries:
 playwright install chromium
-# On a fresh Linux machine you may also need the system libraries:
-# playwright install --with-deps chromium
+# or: playwright install --with-deps chromium
 
-# 4. Configure the token
 cp .env.example .env
-# Edit .env and put your real token after TELEGRAM_BOT_TOKEN=
+# Edit .env and set TELEGRAM_BOT_TOKEN=your_real_token
 
-# 5. Run the bot
 python bot.py
 ```
 
-Then message your bot:
+Then message the bot:
 
 ```text
 /start
@@ -108,102 +111,130 @@ Then message your bot:
 https://vplink.in/example
 ```
 
-You must run `playwright install chromium` locally before testing. On Railway,
-`railway.toml` performs that step automatically during the build.
+The bot first replies `⏳ Bypassing…`, then edits that message with either
+`✅ Destination:` and the final URL or a `❌` error.
+
+### Quick offline checks
+
+```bash
+python -c "import bypasser; print(bypasser._is_final_url('https://onlinewish.in/x'))"
+# False
+python -c "import bypasser; print(bypasser._is_final_url('https://example.com/file'))"
+# True
+python -m py_compile bot.py bypasser.py
+```
 
 ---
 
-## 3. Deploy to Railway
+## 3. Push to GitHub
 
-1. **Push the project to GitHub.** Make sure `.env` is **not** committed (only
-   `.env.example` should be in the repository).
-2. In [Railway](https://railway.app/), create a **New Project** and choose
-   **Deploy from GitHub repo**. Select this repository.
-3. Open the new service and go to **Variables**. Add:
+```bash
+git add .
+git commit -m "Browser-based ad-funnel bypass for arolinks and vplink"
+git branch -M main
+git remote add origin https://github.com/<your-user>/<your-repo>.git
+git push -u origin main
+```
+
+Make sure `.env` is **not** committed (it is already in `.gitignore`); only
+`.env.example` should be tracked.
+
+---
+
+## 4. Deploy on Railway
+
+1. In [Railway](https://railway.app/), click **New Project** →
+   **Deploy from GitHub repo** and select this repository.
+2. Open the service → **Variables** → add:
 
    ```text
    TELEGRAM_BOT_TOKEN=your_real_token
    ```
 
-4. Railway reads `railway.toml` and runs:
+3. Railway reads `railway.toml` and runs during build:
 
    ```text
    pip install --upgrade pip
    pip install -r requirements.txt
    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright \
-     python -m playwright install --with-deps chromium
+     python -m playwright install chromium --with-deps
    ```
 
-   Browsers are written to `/app/.cache/ms-playwright` so they survive into the
-   runtime image. `bypasser.py` detects that directory and points Playwright at
-   it automatically. The start command is `python bot.py` (the `Procfile` also
-   declares a `worker`).
-5. Open **Deployments → View logs** and wait for
-   `Bot is starting with long polling...`.
-6. Send `/start` to your bot on Telegram.
+   Browsers are written to `/app/.cache/ms-playwright`, and `bypasser.py`
+   automatically points Playwright there when the directory exists. The start
+   command is `python bot.py`.
+4. Open **Deployments → View logs**. A healthy deploy ends with:
 
-### Important Railway notes
+   ```text
+   Bot is starting with long polling...
+   ```
 
-- **Run exactly one replica.** Telegram long polling uses a single
-  `getUpdates` consumer; two replicas will fight over updates. Do not enable
-  horizontal scaling for this service.
-- **Memory:** headless Chromium typically needs 300–600 MB at runtime. Give
-  the service at least **1 GB** of RAM. If the container is killed with an
-  out-of-memory error, raise the memory limit or run Chromium less often.
-- **Build time:** downloading Chromium and its Linux dependencies makes the
-  first build noticeably slower (a few minutes).
-- **Python version:** Nixpacks normally selects Python 3.11 or 3.12, which are
-  compatible with the pinned Playwright version. If Railway selects Python
-  3.13+ and the `greenlet` dependency fails to build, add the variable
-  `NIXPACKS_PYTHON_VERSION=3.12` in Railway and redeploy.
-- **If `playwright install --with-deps` fails during the Nixpacks build**
-  (for example because `apt-get` is unavailable), switch the Railway service
-  to a Dockerfile based on the official image
-  `mcr.microsoft.com/playwright/python:v1.44.0-jammy`, then run
-  `pip install -r requirements.txt` and `python bot.py` in that image.
-- The bot uses polling, not webhooks, so no public domain or port is needed.
+   Earlier in the build log you should see Playwright downloading Chromium (for
+   example `Downloading Chromium ...` and `Chromium ... downloaded to
+   /app/.cache/ms-playwright`). A successful build also logs `Installing
+   dependencies` / apt package installation for Chromium.
+5. Send `/start` to the bot.
 
----
+### Railway notes and warnings
 
-## 4. Configuration reference
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Yes | Token from @BotFather. |
-
-Other tuning constants live at the top of `bypasser.py`:
-`HTTP_TIMEOUT`, `PAGE_TIMEOUT_MS`, `TOTAL_TIMEOUT`, `USER_AGENT`,
-`BROWSER_ARGS` and `BLOCKED_HOSTS`.
+- **Run exactly one replica.** Telegram long polling must have a single
+  `getUpdates` consumer; two replicas will fight over updates.
+- **Memory:** headless Chromium needs roughly **300–600 MB** at runtime. Give
+  the service at least **1 GB** of RAM. Railway's free tier may not be enough
+  for heavy use; the container can be killed for OOM under load.
+- **Build time:** downloading Chromium and its OS libraries makes the first
+  build take several minutes.
+- **Python version:** Nixpacks usually chooses Python 3.11/3.12. If it picks
+  3.13+ and `greenlet` fails to build, set
+  `NIXPACKS_PYTHON_VERSION=3.12` in Railway variables and redeploy.
+- **If `playwright install --with-deps` fails** (for example, no `apt-get` in
+  the builder), use a Dockerfile based on
+  `mcr.microsoft.com/playwright/python:v1.48.0-jammy`, run
+  `pip install -r requirements.txt`, and start with `python bot.py`.
+- No public domain or port is needed because the bot uses polling, not webhooks.
 
 ---
 
-## 5. Troubleshooting
+## 5. Reading Railway logs when deployment fails
 
-| Symptom | Likely cause / fix |
+| Symptom in logs | Meaning / fix |
 | --- | --- |
-| `TELEGRAM_BOT_TOKEN is not set` | Missing `.env` locally or missing Railway variable. |
-| `Executable doesn't exist ... chromium` | Run `playwright install chromium` (local) or check the Railway build log. |
-| `Target page, context or browser has been closed` | A navigation or popup closed the page; retry the link. The handler catches this and reports an error. |
-| Every link times out | Railway container may be short on memory/CPU. Increase resources or retry later. |
-| Cloudflare never clears | The site changed its challenge. Update the selectors in `_wait_for_cloudflare` and `_click_continue`. |
-| "Destination link could not be found" | The shortener changed its HTML/JS. Inspect the page and adjust `_extract_from_html` / click regexes. |
+| `TELEGRAM_BOT_TOKEN is not set` | Variable missing in Railway → Variables, or the service did not redeploy. |
+| `Executable doesn't exist at .../chrome-linux/chrome` | Chromium was not installed in the runtime image. Check the build command and that `PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright` is set. |
+| `Host system is missing dependencies` / `libasound.so.2` | `--with-deps` did not install system libraries. Use the official Playwright Docker image or install deps manually. |
+| Build log stops at `playwright install` | The builder lacks apt/root. Switch to the Docker image approach above. |
+| `Chromium could not start` at runtime | Usually missing shared libraries or not enough memory. Check the build log and raise the memory limit. |
+| `Conflict: terminated by other getUpdates request` | More than one replica is running. Scale to exactly one. |
+| Repeated `Could not escape the ad funnel` | The site changed its ad funnel. Update the selectors (see Maintenance). |
+| `Navigation timeout` for every link | Site is slow/blocking, or the container is resource-starved. Retry and check CPU/RAM. |
 
 ---
 
-## 6. Maintenance
+## 6. Maintenance (what to edit when a site changes)
 
-Shortener sites change their markup, advertising flow and anti-bot protection
-frequently. Expect to revisit:
+Shortener sites change markup and ad partners often. The exact places to edit
+in `bypasser.py`:
 
-- `_extract_from_html` — static URL/meta-refresh/JS-variable patterns.
-- `_detect_timer_seconds` — countdown formats.
-- `_wait_for_cloudflare` — challenge page indicators.
-- `_click_continue` — button labels and selectors.
-- `BLOCKED_HOSTS` — new advertising/tracking domains.
+- **Lines 78–84: `BLACKLIST_DOMAINS`** — add any new intermediate ad domain
+  (for example a new `*.in` funnel site). This is the list that prevents the bot
+  from returning an ad page.
+- **Lines 88–98: `CLICK_SELECTORS`** — update button text or IDs. This is the
+  first thing to change when the loop clicks nothing.
+- **Lines 542–560: the navigation loop comment and `for iteration in
+  range(1, MAX_ITERATIONS + 1)` block** — change the wait time or iteration
+  count only if needed. The loop body is generic; prefer editing the selectors.
+- **Lines 431–475: `_find_destination_link`** — adjust anchor ranking if the
+  fallback picks a navigation link instead of the real destination.
 
-Keep Playwright and Chromium reasonably current (`playwright==...` in
-`requirements.txt` plus `python -m playwright install --with-deps chromium`),
-because Cloudflare and site scripts evolve.
+After editing, run `python -m py_compile bypasser.py` and retest one known link
+before redeploying.
 
-Finally: respect the law and the target sites' terms. This bot is intended for
-personal, authorized use only.
+---
+
+## 7. Legal and resource summary
+
+Bypassing these shorteners violates their Terms of Service and may violate the
+terms of the destination sites. This project is for personal/educational use
+only, with no warranty. Playwright/Chromium requires roughly 500 MB of RAM, so
+Railway's free tier may not be sufficient for heavy use. Keep only one bot
+replica running and monitor memory if you process many links.

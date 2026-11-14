@@ -165,7 +165,7 @@ async def _handle_bypass(message, context: ContextTypes.DEFAULT_TYPE, raw: str) 
         )
         return
 
-    status = await message.reply_text("🔎 Bypassing, please wait…")
+    status = await message.reply_text("⏳ Bypassing…")
     try:
         await context.bot.send_chat_action(
             chat_id=message.chat_id, action=ChatAction.TYPING
