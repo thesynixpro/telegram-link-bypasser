@@ -13,7 +13,7 @@ beautifulsoup4==4.12.3
 # On Linux servers/CI use:
 #   playwright install --with-deps chromium
 # Railway installs the browser automatically via railway.toml.
-playwright==1.44.0
+playwright==1.48.0
 
 # Loads .env during local development
 python-dotenv==1.0.1
