@@ -46,9 +46,6 @@ import time
 from typing import Optional
 from urllib.parse import urlparse
 
-import cloudscraper
-from bs4 import BeautifulSoup
-
 # Railway installs Chromium into /app so it is present in the runtime image.
 # Locally that directory does not exist and Playwright uses its normal cache.
 _RAILWAY_BROWSERS = "/app/.cache/ms-playwright"
@@ -74,25 +71,33 @@ logger = logging.getLogger(__name__)
 SUPPORTED_DOMAINS = ("arolinks.com", "vplink.in")
 
 # These hosts are NEVER a valid destination.  The bot keeps navigating until
-# the current URL is outside this list.  Add new ad-funnel domains here.
+# the current URL is outside this list.  The ad-partner domains rotate, so this
+# list is only the first line of defence: `_page_is_ad_gate()` also inspects the
+# page markup so new funnel domains are not returned as the final URL.
 BLACKLIST_DOMAINS = [
     "arolinks.com",
     "vplink.in",
     "onlinewish.in",
     "crimejasoos.in",
+    "pipefitter.in",
+    "apnahirework.com",
+    "entiredust.in",
 ]
 
-# Tried in this order on every navigation-loop pass.  If a site changes its
-# button text or IDs, update this list first -- nothing else in the loop needs
-# to change.
+# Tried in this order on every navigation-loop pass.  Real controls come first;
+# generic article links come last so an ad "Continue" button cannot win over
+# the actual Verify/Get Link control.  #btn7 is handled separately (its href is
+# followed directly, bypassing its ad-opening onclick handler).
 CLICK_SELECTORS = [
-    'button:has-text("Continue")',
+    "#btn6",                     # arolinks Verify button
+    "#getlink",                  # common vplink-style get-link button ID
+    "#go-submit",
+    'button:has-text("Verify")',
     'button:has-text("Get Link")',
     'button:has-text("Skip Ad")',
-    'a:has-text("Continue")',
     'a:has-text("Get Link")',
-    "#btn6",       # common arolinks download button ID
-    "#getlink",    # common vplink-style get-link button ID
+    'button:has-text("Continue")',
+    'a:has-text("Continue")',
 ]
 
 USER_AGENT = (
@@ -107,8 +112,7 @@ MAX_ITERATIONS = 8            # hard cap for the navigation loop
 WAIT_MIN_MS = 4_000           # let JS countdowns / Cloudflare settle
 WAIT_MAX_MS = 6_000
 STABLE_SECONDS = 3.0          # URL must stop changing for this long
-TOTAL_BYPASS_TIMEOUT = 180    # seconds, outer safety net for one link
-FAST_PATH_TIMEOUT = 25        # seconds, cloudscraper request
+TOTAL_BYPASS_TIMEOUT = 240    # seconds, outer safety net for one link
 
 # Chromium refuses to run as root in a container without --no-sandbox.
 BROWSER_ARGS = [
@@ -119,9 +123,9 @@ BROWSER_ARGS = [
     "--disable-software-rasterizer",
     "--no-first-run",
     "--no-default-browser-check",
+    "--disable-blink-features=AutomationControlled",
 ]
 
-_META_REFRESH_RE = re.compile(r"""url\s*=\s*["']?([^"'\s>]+)""", re.I)
 _JS_LOCATION_RE = re.compile(
     r"""(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']""", re.I
 )
@@ -236,74 +240,7 @@ def _clean_candidate(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fast path for arolinks.com
-# ---------------------------------------------------------------------------
-
-def _fast_path_sync(url: str) -> Optional[str]:
-    """
-    Try to recover the destination from the raw HTML with cloudscraper.
-
-    This is only used for arolinks.com.  We return a candidate ONLY if it is
-    present in a meta refresh or ``window.location.href`` assignment and is not
-    blacklisted.  Anything else falls through to Playwright.
-    """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "no-cache",
-    }
-
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        response = scraper.get(
-            url, headers=headers, timeout=FAST_PATH_TIMEOUT, allow_redirects=True
-        )
-    except Exception as exc:
-        logger.info("arolinks fast path could not fetch %s: %s", url, exc)
-        return None
-
-    if response.status_code >= 400 or not response.text:
-        logger.info("arolinks fast path got HTTP %s", response.status_code)
-        return None
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # 1. <meta http-equiv="refresh" content="5;url=https://...">
-    for meta in soup.find_all("meta"):
-        if "refresh" not in (meta.get("http-equiv") or "").lower():
-            continue
-        match = _META_REFRESH_RE.search(meta.get("content") or "")
-        if not match:
-            continue
-        candidate = _clean_candidate(match.group(1))
-        if _is_final_url(candidate):
-            logger.info("arolinks fast path found meta refresh: %s", candidate)
-            return candidate
-
-    # 2. window.location.href = "https://..."
-    scripts = "\n".join(
-        script.get_text() or "" for script in soup.find_all("script")
-    )
-    scripts = scripts.replace("\\/", "/")
-    for match in _JS_LOCATION_RE.finditer(scripts):
-        candidate = _clean_candidate(match.group(1))
-        if _is_final_url(candidate):
-            logger.info("arolinks fast path found JS location: %s", candidate)
-            return candidate
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Playwright helpers
+# Browser helpers
 # ---------------------------------------------------------------------------
 
 async def _accept_dialog(dialog) -> None:
@@ -344,7 +281,11 @@ async def _try_cloudflare_checkbox(page) -> bool:
         except Exception:
             continue
 
-        for selector in ("input[type='checkbox']", "label"):
+        for selector in (
+            "input[type='checkbox']",
+            "div[role='checkbox']",
+            "label",
+        ):
             try:
                 locator = frame.locator(selector)
                 if await locator.count() == 0:
@@ -479,8 +420,320 @@ async def _find_destination_link(page) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Ad-gate detection and arolinks final-gate handling
+# ---------------------------------------------------------------------------
+
+async def _page_is_ad_gate(page) -> bool:
+    """
+    True when the current page is an advertising gate, not a destination.
+
+    The static blacklist cannot cover every rotating ad domain (pipefitter.in,
+    apnahirework.com, entiredust.in, ...).  These markers are the giveaway:
+    countdown/Verify/Continue screens, ad cookies, and the /readmore hop.
+    """
+    try:
+        html = (await page.content()).lower()
+    except Exception:
+        return False
+
+    strong_markers = (
+        'id="btn6"',
+        "id='btn6'",
+        'id="btn7"',
+        "id='btn7'",
+        "adcadg",
+        "ce-wait",
+        "specialactionhandler",
+        'id="go-link"',
+        'id="get-link"',
+        "aroshield.setup",
+        "your link is almost ready",
+    )
+    if any(marker in html for marker in strong_markers):
+        return True
+
+    try:
+        parsed = urlparse(page.url)
+    except Exception:
+        return False
+
+    if "/readmore" in (parsed.path or "").lower():
+        return True
+    if re.search(r"(?:^|&)(?:st|pgtr)=\d+", (parsed.query or "").lower()):
+        return True
+
+    return False
+
+
+async def _is_arolinks_gate(page) -> bool:
+    """True when the arolinks final verification/captcha gate is loaded."""
+    try:
+        html = (await page.content()).lower()
+    except Exception:
+        return False
+
+    if "aroshield.setup" in html:
+        return True
+    return "/links/go" in html and "cf-turnstile" in html
+
+
+async def _get_ad_referer(page, short_url: str) -> Optional[str]:
+    """
+    Find the ad-partner URL the shortener redirected to.
+
+    arolinks' final gate is only disclosed when the request's Referer points at
+    one of its ad partners.  The redirect target is either the current page URL
+    or the window.location.href assignment in the initial HTML.
+    """
+    short_host = extract_domain(short_url)
+
+    try:
+        current = page.url
+    except Exception:
+        current = ""
+
+    def _origin(value: str) -> Optional[str]:
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            return None
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}/"
+
+    if current and current.startswith(("http://", "https://")):
+        host = extract_domain(current)
+        if host and host != short_host and not host.endswith("." + short_host):
+            return _origin(current)
+
+    try:
+        html = await page.content()
+    except Exception:
+        return None
+
+    for match in _JS_LOCATION_RE.finditer(html.replace("\\/", "/")):
+        candidate = _clean_candidate(match.group(1))
+        host = extract_domain(candidate)
+        if host and host != short_host:
+            origin = _origin(candidate)
+            if origin:
+                return origin
+
+    return None
+
+
+async def _navigate_readmore(page) -> bool:
+    """
+    Follow the real `/readmore` hop directly.
+
+    On pipefitter-style gates, #btn7 looks like a Continue button, but its
+    onclick opens an ad tab and returns false.  Navigating to its href skips
+    the popup and advances the funnel.
+    """
+    target = None
+    try:
+        href = await page.evaluate(
+            """
+            () => {
+                const btn7 = document.querySelector('#btn7[href]');
+                if (btn7 && btn7.getAttribute('href')) return btn7.href;
+                const link = document.querySelector(
+                    'a[href*="/readmore"], a[href*="readmore"]'
+                );
+                return link ? link.href : null;
+            }
+            """
+        )
+        if href:
+            target = _clean_candidate(str(href))
+    except Exception:
+        target = None
+
+    if not target or target.startswith("javascript:"):
+        return False
+
+    try:
+        logger.info("Following gate hop: %s", target)
+        await page.goto(
+            target, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS
+        )
+        return True
+    except Exception as exc:
+        logger.info("Could not follow %s: %s", target, exc)
+        return False
+
+
+async def _turnstile_token(page) -> str:
+    """Return the current Cloudflare Turnstile token, if the widget solved."""
+    try:
+        return (
+            await page.evaluate(
+                """
+                () => {
+                    const input = document.querySelector(
+                        'input[name="cf-turnstile-response"]'
+                    );
+                    return input ? input.value : '';
+                }
+                """
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+async def _capture_links_go(response, captured: dict) -> None:
+    """Store the destination URL returned by arolinks' POST /links/go."""
+    try:
+        if "/links/go" not in (response.url or ""):
+            return
+    except Exception:
+        return
+
+    try:
+        data = await response.json()
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        url = data.get("url") or data.get("link") or data.get("destination")
+        if isinstance(url, str):
+            cleaned = _clean_candidate(url)
+            if cleaned and cleaned != "#" and _is_final_url(cleaned):
+                captured["url"] = cleaned
+                return
+
+    try:
+        location = response.headers.get("location")
+    except Exception:
+        location = None
+    if location and _is_final_url(location):
+        captured["url"] = _clean_candidate(location)
+
+
+async def _solve_arolinks_gate(page, captured: dict) -> Optional[str]:
+    """
+    Complete the arolinks "Your link is almost ready" gate.
+
+    The page renders an explicit Cloudflare Turnstile, waits 8 seconds
+    (AroShield), then jQuery-submits #go-link to /links/go.  That endpoint
+    answers with JSON `{url: ...}`.  Chromium must be used because Cloudflare
+    challenges the POST otherwise.
+
+    #get-link is only a label (href="javascript:void(0)"); clicking it triggers
+    an ad-overlay click handler that can hijack the tab, so submission is
+    driven through the form instead.
+    """
+    if not await _is_arolinks_gate(page):
+        return None
+
+    logger.info("arolinks final gate detected; waiting for verification")
+
+    async def form_ready() -> bool:
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const f = document.getElementById('go-link');
+                        return !!f && f.classList.contains('go-link');
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    async def submit_go_form() -> None:
+        try:
+            await page.evaluate(
+                """
+                () => {
+                    const f = document.getElementById('go-link');
+                    if (!f) return;
+                    if (window.jQuery) window.jQuery(f).submit();
+                    else if (f.requestSubmit) f.requestSubmit();
+                    else f.submit();
+                }
+                """
+            )
+            logger.info("Submitted arolinks #go-link form")
+        except Exception:
+            pass
+
+    # 1. Wait for Turnstile to produce a token (click the checkbox if shown).
+    token_deadline = time.monotonic() + 45
+    while time.monotonic() < token_deadline:
+        if captured.get("url"):
+            return captured["url"]
+        await _try_cloudflare_checkbox(page)
+        if await _turnstile_token(page):
+            logger.info("Turnstile token obtained")
+            break
+        await page.wait_for_timeout(1000)
+
+    # 2. Wait for AroShield's countdown to finish, then submit (the page often
+    #    auto-submits on its own; this is just a guaranteed trigger).
+    countdown_deadline = time.monotonic() + 20
+    while time.monotonic() < countdown_deadline:
+        if captured.get("url"):
+            return captured["url"]
+        if await form_ready():
+            break
+        await page.wait_for_timeout(1000)
+
+    for attempt in range(3):
+        if captured.get("url"):
+            return captured["url"]
+
+        if await _turnstile_token(page):
+            await submit_go_form()
+
+        # 3. Wait for the AJAX response carrying the destination.
+        for _ in range(15):
+            if captured.get("url"):
+                return captured["url"]
+            try:
+                current = page.url
+            except Exception:
+                current = ""
+            if _is_final_url(current) and not await _page_is_ad_gate(page):
+                return current
+            await page.wait_for_timeout(1000)
+
+        # A token is single-use: refresh the widget and try again.
+        logger.info("No /links/go answer yet; refreshing Turnstile")
+        try:
+            await page.click("#aro-ts-refresh", timeout=3000)
+        except Exception:
+            try:
+                await page.evaluate(
+                    "() => { if (window.turnstile) window.turnstile.reset(); }"
+                )
+            except Exception:
+                pass
+        await page.wait_for_timeout(3000)
+
+    return captured.get("url")
+
+
+# ---------------------------------------------------------------------------
 # Core browser navigation: escape the ad funnel
 # ---------------------------------------------------------------------------
+
+async def _find_gate_page(context):
+    """Return the first open tab showing the arolinks final gate."""
+    for candidate in list(context.pages):
+        try:
+            if candidate.is_closed():
+                continue
+            if await _is_arolinks_gate(candidate):
+                return candidate
+        except Exception:
+            continue
+    return None
+
 
 async def _escape_ad_funnel(url: str) -> str:
     """
@@ -492,11 +745,21 @@ async def _escape_ad_funnel(url: str) -> str:
             "Browser support is not installed on the server (Playwright missing)."
         )
 
+    captured: dict[str, str] = {}
+
     async with async_playwright() as playwright:
         try:
-            browser = await playwright.chromium.launch(
-                headless=True, args=BROWSER_ARGS
-            )
+            # channel="chromium" selects Chrome's new headless mode (Playwright
+            # 1.49+). It looks much more like a normal browser to Cloudflare
+            # than the legacy headless shell. Fall back if unavailable.
+            try:
+                browser = await playwright.chromium.launch(
+                    channel="chromium", headless=True, args=BROWSER_ARGS
+                )
+            except Exception:
+                browser = await playwright.chromium.launch(
+                    headless=True, args=BROWSER_ARGS
+                )
         except Exception as exc:
             raise BypassError(
                 "Chromium could not start. The server is probably missing "
@@ -510,13 +773,61 @@ async def _escape_ad_funnel(url: str) -> str:
                 locale="en-US",
                 ignore_https_errors=True,
             )
-            # Remove the most obvious automation fingerprint.
+            # Remove the most obvious automation fingerprints.
             await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', "
-                "{get: () => undefined});"
+                """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 8
+                });
+                Object.defineProperty(navigator, 'deviceMemory', {
+                    get: () => 8
+                });
+                window.chrome = window.chrome || {runtime: {}};
+
+                if (navigator.permissions && navigator.permissions.query) {
+                    const originalQuery = navigator.permissions.query.bind(
+                        navigator.permissions
+                    );
+                    navigator.permissions.query = (parameters) => (
+                        parameters && parameters.name === 'notifications'
+                            ? Promise.resolve({state: Notification.permission})
+                            : originalQuery(parameters)
+                    );
+                }
+
+                try {
+                    const getParameter =
+                        WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function (p) {
+                        if (p === 37445) return 'Intel Inc.';
+                        if (p === 37446) return 'Intel Iris OpenGL Engine';
+                        return getParameter.apply(this, arguments);
+                    };
+                } catch (e) {}
+                """
             )
 
+            def _watch_responses(target_page) -> None:
+                target_page.on(
+                    "response",
+                    lambda response: asyncio.ensure_future(
+                        _capture_links_go(response, captured)
+                    ),
+                )
+
+            context.on("page", _watch_responses)
+
             page = await context.new_page()
+            _watch_responses(page)
             page.set_default_timeout(10_000)
             page.on(
                 "dialog",
@@ -536,23 +847,68 @@ async def _escape_ad_funnel(url: str) -> str:
                     "The shortener page could not be opened. It may be down."
                 ) from exc
 
+            # -----------------------------------------------------------------
+            # arolinks shortcut.
+            #
+            # After the first hop the shortener knows which ad partner sent the
+            # visitor.  Re-requesting the short URL with that partner as the
+            # Referer skips the article chain and returns the final gate
+            # directly.  Without it the server serves a cheap redirect page.
+            # -----------------------------------------------------------------
+            if get_supported_domain(url) == "arolinks.com":
+                ad_referer = await _get_ad_referer(page, url)
+                if ad_referer:
+                    logger.info("Reopening gate with Referer %s", ad_referer)
+                    try:
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=NAV_TIMEOUT_MS,
+                            referer=ad_referer,
+                        )
+                    except Exception as exc:
+                        logger.info("Gate navigation failed: %s", exc)
+
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded", timeout=10_000
+                        )
+                    except Exception:
+                        pass
+
+                    gate_url = await _solve_arolinks_gate(page, captured)
+                    if gate_url and _is_final_url(gate_url):
+                        logger.info("Gate returned destination: %s", gate_url)
+                        return gate_url
+
             await _try_cloudflare_checkbox(page)
 
             # -----------------------------------------------------------------
             # NAVIGATION LOOP
             #
             # On every pass:
-            #   1. Wait 4-6 seconds so JS countdowns / Cloudflare can finish.
-            #   2. Check every open tab.  If the URL is outside the blacklist
-            #      AND has been stable for 3 seconds, we have escaped.
-            #   3. Otherwise click the next "Continue"/"Get Link"/"Skip Ad"
-            #      control and wait for the next page to load.
+            #   1. Solve the final arolinks gate if it is open in any tab.
+            #   2. Wait 4-6 seconds so JS countdowns / Cloudflare can finish.
+            #   3. Check every open tab.  If the URL is outside the blacklist,
+            #      is not an ad gate and has been stable for 3 seconds, we have
+            #      escaped.
+            #   4. Follow a real /readmore hop when present.
+            #   5. Otherwise click the next Verify/Get Link/Continue control.
             #
-            # If a site changes, the only part to edit is CLICK_SELECTORS at
-            # the top of this file (and BLACKLIST_DOMAINS for new ad hosts).
+            # If a site changes, update CLICK_SELECTORS and BLACKLIST_DOMAINS
+            # at the top of this file.
             # -----------------------------------------------------------------
             for iteration in range(1, MAX_ITERATIONS + 1):
                 page = _current_page(context, page)
+
+                gate_page = await _find_gate_page(context)
+                if gate_page is not None:
+                    gate_url = await _solve_arolinks_gate(gate_page, captured)
+                    if gate_url and _is_final_url(gate_url):
+                        logger.info("Gate returned destination: %s", gate_url)
+                        return gate_url
+                if captured.get("url") and _is_final_url(captured["url"]):
+                    return captured["url"]
 
                 try:
                     await page.wait_for_timeout(
@@ -571,17 +927,31 @@ async def _escape_ad_funnel(url: str) -> str:
 
                     if not _is_final_url(candidate_url):
                         continue
+                    if await _page_is_ad_gate(candidate_page):
+                        continue
 
                     stable_url = await _wait_for_stable_url(
                         candidate_page, STABLE_SECONDS
                     )
-                    if _is_final_url(stable_url):
-                        logger.info(
-                            "Escaped the ad funnel after %d iteration(s): %s",
-                            iteration,
-                            stable_url,
-                        )
-                        return stable_url
+                    if not _is_final_url(stable_url):
+                        continue
+                    if await _page_is_ad_gate(candidate_page):
+                        continue
+
+                    logger.info(
+                        "Escaped the ad funnel after %d iteration(s): %s",
+                        iteration,
+                        stable_url,
+                    )
+                    return stable_url
+
+                if await _navigate_readmore(page):
+                    continue
+
+                # The arolinks gate auto-submits; its anchors carry an ad
+                # overlay that hijacks clicks, so never click them.
+                if await _is_arolinks_gate(page):
+                    continue
 
                 clicked = await _click_next_control(page)
                 if clicked:
@@ -598,10 +968,15 @@ async def _escape_ad_funnel(url: str) -> str:
                     )
 
             # Final verification after the loop.
+            if captured.get("url") and _is_final_url(captured["url"]):
+                return captured["url"]
+
             page = _current_page(context, page)
             for candidate_page in list(context.pages):
                 try:
                     if candidate_page.is_closed():
+                        continue
+                    if await _page_is_ad_gate(candidate_page):
                         continue
                     stable_url = await _wait_for_stable_url(
                         candidate_page, STABLE_SECONDS
@@ -612,10 +987,11 @@ async def _escape_ad_funnel(url: str) -> str:
                     return stable_url
 
             # Last resort: a destination anchor on the blocked page.
-            fallback = await _find_destination_link(page)
-            if fallback and _is_final_url(fallback):
-                logger.info("Using destination anchor fallback: %s", fallback)
-                return fallback
+            if not await _page_is_ad_gate(page):
+                fallback = await _find_destination_link(page)
+                if fallback and _is_final_url(fallback):
+                    logger.info("Using destination anchor fallback: %s", fallback)
+                    return fallback
 
             raise BypassError(
                 "Could not escape the ad funnel — the shortener may have "
@@ -639,16 +1015,8 @@ async def bypass_arolinks(url: str) -> str:
     if get_supported_domain(url) != "arolinks.com":
         raise BypassError("That link does not belong to arolinks.com.")
 
-    # Optional fast path: many arolinks pages leak the target in raw HTML.
-    try:
-        fast_result = await asyncio.wait_for(
-            asyncio.to_thread(_fast_path_sync, url), timeout=FAST_PATH_TIMEOUT + 5
-        )
-        if fast_result and _is_final_url(fast_result):
-            return fast_result
-    except Exception as exc:
-        logger.info("arolinks.com fast path skipped: %s", exc)
-
+    # No static fast path: arolinks hides the destination behind a Turnstile
+    # gate, and the pre-gate redirect only leads to rotating ad articles.
     try:
         return await asyncio.wait_for(
             _escape_ad_funnel(url), timeout=TOTAL_BYPASS_TIMEOUT

@@ -23,7 +23,7 @@ once it is outside the blacklist and has stopped changing.
 | File | Purpose |
 | --- | --- |
 | `bot.py` | Telegram entry point: `/start`, `/bypass <url>`, and plain-message URL detection. Long polling, async handlers, full logging. |
-| `bypasser.py` | All bypass logic: blacklist, `_is_final_url`, cloudscraper fast path for arolinks, and the Playwright domain-escape loop for both sites. |
+| `bypasser.py` | All bypass logic: blacklist, `_is_final_url`, ad-gate detection, the arolinks Referer/Turnstile gate solver, and the Playwright domain-escape loop for both sites. |
 | `requirements.txt` | Pinned Python dependencies. |
 | `Procfile` | Declares a Railway/Heroku-style worker: `worker: python bot.py`. |
 | `railway.toml` | Nixpacks build that installs Python deps and Chromium with system libraries. |
@@ -36,28 +36,35 @@ once it is outside the blacklist and has stopped changing.
 
 The core fix is in `_escape_ad_funnel()` in `bypasser.py`:
 
-1. Launch headless Chromium with a Windows Chrome User-Agent and a
-   `1920x1080` viewport.
-2. Open the shortener URL with `wait_until="domcontentloaded"` and a 30-second
-   timeout.
-3. Run at most **8 iterations**. On each pass:
+1. Launch Chromium with a Windows Chrome User-Agent, a `1920x1080` viewport and
+   automation-fingerprint patches. `channel="chromium"` (Playwright 1.50) uses
+   Chrome's new headless mode, which is harder for Cloudflare to fingerprint.
+2. Open the shortener URL. **arolinks.com special case:** capture the ad-partner
+   origin it redirects to, then re-request the short URL with
+   `Referer: <ad-partner-origin>`. That request returns the final
+   "Your link is almost ready" gate instead of another ad article.
+3. On the gate, wait for the Cloudflare Turnstile token, let the 8-second
+   AroShield countdown finish, and submit `#go-link`. The page's own jQuery
+   handler POSTs to `/links/go` and returns JSON `{ "url": ... }`, which is
+   captured from the network response. The gate's anchors are never clicked
+   because they carry an ad-overlay handler that hijacks the tab.
+4. For other funnel pages, run at most **8 iterations**. On each pass:
    - Wait a random **4–6 seconds** for JavaScript countdowns / Cloudflare.
    - Inspect every open tab. A URL is accepted only if its host is **not** in
-     `BLACKLIST_DOMAINS` **and** the URL has been stable for 3 seconds.
+     `BLACKLIST_DOMAINS`, the page does not look like an ad gate, and the URL
+     has been stable for 3 seconds.
+   - Follow a real `/readmore` hop (`#btn7[href]`) directly when present.
    - Otherwise click the first visible control from `CLICK_SELECTORS`
-     (`Continue`, `Get Link`, `Skip Ad`, `#btn6`, `#getlink`, ...) and wait for
-     the next page.
-4. If the funnel is still blocked after the loop, scan the page anchors for a
-   non-blacklisted `http(s)` link, prioritizing link text like `Download`,
+     (`Verify`, `Get Link`, `Skip Ad`, `#btn6`, `#getlink`, ...).
+5. If the funnel is still blocked after the loop, scan the page anchors for a
+   non-blacklisted `http(s)` link, prioritizing text like `Download`,
    `Continue`, or `Here`.
-5. If no final URL exists, raise
+6. If no final URL exists, raise
    `BypassError("Could not escape the ad funnel — the shortener may have changed its layout.")`
 
-`arolinks.com` also gets an optional cloudscraper fast path: if the raw HTML
-contains a meta refresh or `window.location.href` pointing outside the
-blacklist, that URL is returned immediately. Otherwise the browser path runs.
-`vplink.in` always goes straight to Playwright because of Cloudflare and the
-multi-hop funnel.
+There is no static HTTP fast path: arolinks hides the destination behind
+Turnstile, and the pre-gate redirect only leads to rotating ad articles. The
+browser path is therefore used for both supported sites.
 
 The shortener/ad-partner blacklist is:
 
@@ -66,7 +73,14 @@ arolinks.com
 vplink.in
 onlinewish.in
 crimejasoos.in
+pipefitter.in
+apnahirework.com
+entiredust.in
 ```
+
+Ad domains rotate, so `_page_is_ad_gate()` also inspects the page for markers
+such as `#btn6`, `#btn7`, `AroShield.setup`, `/readmore`, and `st=N`. A URL must
+pass both checks before it is returned.
 
 Everything is closed in a `finally` block. There is no paid API and no external
 bypass service.
@@ -189,7 +203,7 @@ Make sure `.env` is **not** committed (it is already in `.gitignore`); only
   `NIXPACKS_PYTHON_VERSION=3.12` in Railway variables and redeploy.
 - **If `playwright install --with-deps` fails** (for example, no `apt-get` in
   the builder), use a Dockerfile based on
-  `mcr.microsoft.com/playwright/python:v1.48.0-jammy`, run
+  `mcr.microsoft.com/playwright/python:v1.50.0-jammy`, run
   `pip install -r requirements.txt`, and start with `python bot.py`.
 - No public domain or port is needed because the bot uses polling, not webhooks.
 
@@ -215,16 +229,17 @@ Make sure `.env` is **not** committed (it is already in `.gitignore`); only
 Shortener sites change markup and ad partners often. The exact places to edit
 in `bypasser.py`:
 
-- **Lines 78–84: `BLACKLIST_DOMAINS`** — add any new intermediate ad domain
-  (for example a new `*.in` funnel site). This is the list that prevents the bot
-  from returning an ad page.
-- **Lines 88–98: `CLICK_SELECTORS`** — update button text or IDs. This is the
-  first thing to change when the loop clicks nothing.
-- **Lines 542–560: the navigation loop comment and `for iteration in
-  range(1, MAX_ITERATIONS + 1)` block** — change the wait time or iteration
-  count only if needed. The loop body is generic; prefer editing the selectors.
-- **Lines 431–475: `_find_destination_link`** — adjust anchor ranking if the
-  fallback picks a navigation link instead of the real destination.
+- **`BLACKLIST_DOMAINS`** — add any new intermediate ad domain (for example a
+  new `*.in` funnel site). This is the first list that prevents the bot from
+  returning an ad page.
+- **`CLICK_SELECTORS`** — update button text or IDs. This is the first thing to
+  change when the loop clicks nothing.
+- **`_page_is_ad_gate()`** — add a new markup marker if a rotating ad host is
+  not in the blacklist yet.
+- **`_solve_arolinks_gate()`** — update if arolinks changes its Turnstile
+  widget, countdown, or `/links/go` response shape.
+- **`_find_destination_link()`** — adjust anchor ranking if the fallback picks a
+  navigation link instead of the real destination.
 
 After editing, run `python -m py_compile bypasser.py` and retest one known link
 before redeploying.
